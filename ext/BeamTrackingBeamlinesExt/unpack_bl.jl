@@ -10,6 +10,7 @@ function _track!(
   ramp_update_each_particle;
   kwargs...
 )
+  print("Test HELLO JH")
   # Unpack the line element (type unstable)
   L = float(ele.L) # Automatically calls deval (element-level get)
   # float call is required because L is allowed to be any type
