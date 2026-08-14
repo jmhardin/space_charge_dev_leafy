@@ -22,6 +22,7 @@ Arguments
 - 'L'        -- length
 """
 @makekernel fastgtpsa=true function bkb_multipole!(i, coords::Coords, s, radiation_params, tilde_m, beta_0, a, g, w, w_inv, k0, mm, kn, ks, L)
+  other_multipoles = (length(mm) > 1)
   knl = kn .* L ./ 2
   ksl = ks .* L ./ 2
 
@@ -37,8 +38,8 @@ Arguments
     rotation!(i, coords, w, 0)
   end
 
-  if !isnothing(coords.q)
-    rotate_spin!(i, coords, a, g, tilde_m, mm, kn, ks, L / 2)
+  if !isnothing(coords.q) && other_multipoles
+    rotate_spin!(i, coords, a, g, tilde_m, mm, kn, ks, 1, L / 2)
   end
 
   if !isnothing(radiation_params)
@@ -46,16 +47,22 @@ Arguments
     deterministic_radiation_multipole!(i, coords, q, mc2, E_ref, g, mm, kn, ks, L / 2)
   end
 
-  multipole_kick!(i, coords, mm, knl, ksl, 1)
-  exact_bend!(i, coords, g*L, g, k0, tilde_m, beta_0, L)
-  multipole_kick!(i, coords, mm, knl, ksl, 1)
+  if other_multipoles
+    multipole_kick!(i, coords, mm, knl, ksl, 1)
+  end
+
+  exact_bend!(i, coords, g*L, g, k0, tilde_m, beta_0, a, L)
+
+  if other_multipoles
+    multipole_kick!(i, coords, mm, knl, ksl, 1)
+  end
 
   if !isnothing(radiation_params)
     deterministic_radiation_multipole!(i, coords, q, mc2, E_ref, g, mm, kn, ks, L / 2)
   end
 
-  if !isnothing(coords.q)
-    rotate_spin!(i, coords, a, g, tilde_m, mm, kn, ks, L / 2)
+  if !isnothing(coords.q) && other_multipoles
+    rotate_spin!(i, coords, a, g, tilde_m, mm, kn, ks, 1, L / 2)
   end
 
   if !isnothing(w_inv)
@@ -64,7 +71,7 @@ Arguments
 end 
 
 """
-    exact_bend!(i, coords::Coords, theta, g, Kn0, tilde_m, beta_0, L)
+    exact_bend!(i, coords::Coords, theta, g, Kn0, tilde_m, beta_0, a, L)
 
 Tracks a particle through a sector bend via exact tracking.
 
@@ -74,13 +81,17 @@ Tracks a particle through a sector bend via exact tracking.
 - 'Kn0'      -- normalized dipole field
 - 'tilde_m'  -- mc2/p0c
 - 'beta_0'   -- p0c/E0
+- 'a'        -- anomalous gyromagnetic ratio
 - 'L'        -- length
 """
-@makekernel fastgtpsa=true function exact_bend!(i, coords::Coords, theta, g, Kn0, tilde_m, beta_0, L)
+@makekernel fastgtpsa=true function exact_bend!(i, coords::Coords, theta, g, Kn0, tilde_m, beta_0, a, L)
   v = coords.v
+  px_0 = v[i,PXI]
+  py_0 = v[i,PYI]
   rel_p = 1 + v[i,PZI]
+  rel_p2 = rel_p*rel_p
 
-  pt2 = rel_p*rel_p - v[i,PYI]*v[i,PYI]
+  pt2 = rel_p2 - v[i,PYI]*v[i,PYI]
   good_momenta = (pt2 > 0)
   alive_at_start = (coords.state[i] == STATE_ALIVE)
   coords.state[i] = vifelse(!good_momenta & alive_at_start, STATE_LOST, coords.state[i])
@@ -99,14 +110,12 @@ Tracks a particle through a sector bend via exact tracking.
   phi1 = theta + asin(vifelse(good_arg, arg, arg_0))
   gp = Kn0 / pt
   h = 1 + g*v[i,XI] 
-  cplus = cos(phi1) 
-  splus = sin(phi1)
+  splus, cplus = sincos(phi1)
   sinc_theta = sincu(theta)
-  sinc_theta_2 = sincu(theta/2)
-  cosc_theta = sinc_theta_2*sinc_theta_2/2
+  cosc_theta = one_cos_norm(theta)
   sgn = sign(L)
   alpha_helper = h*L*sinc_theta
-  alpha = 2*h*splus*L*sinc_theta - gp*alpha_helper*alpha_helper
+  alpha = alpha_helper*(2*splus - gp*alpha_helper)
 
   cond = cplus*cplus + gp*alpha
   good_cond = (cond > 0)
@@ -134,33 +143,42 @@ Tracks a particle through a sector bend via exact tracking.
   new_px = pt*sin(phi1 - thetap)
   new_y = v[i,YI] + v[i,PYI]*Lp/pt
   new_z = v[i,ZI] - rel_p*Lp/pt + L*rel_p/sqrt(tilde_m*tilde_m + rel_p*rel_p)/beta_0
-  v[i,XI]  = vifelse(alive, new_x, v[i,XI])
+  v[i,XI]  = vifelse(alive, new_x,  v[i,XI])
   v[i,PXI] = vifelse(alive, new_px, v[i,PXI])
-  v[i,YI]  = vifelse(alive, new_y, v[i,YI])
-  v[i,ZI]  = vifelse(alive, new_z, v[i,ZI])
-end
+  v[i,YI]  = vifelse(alive, new_y,  v[i,YI])
+  v[i,ZI]  = vifelse(alive, new_z,  v[i,ZI])
 
+  if !isnothing(coords.q) && !isnothing(a)
+    q = coords.q
 
-@makekernel fastgtpsa=true function linear_bend_fringe!(i, coords::Coords, a, tilde_m, Ksol, Kn0, e, sign)
-  v = coords.v
-  alive = (coords.state[i] == STATE_ALIVE)
+    ps2 = pt2 - px_0*px_0
+    good_momenta = (ps2 > 0)
+    alive_at_start = (coords.state[i] == STATE_ALIVE)
+    coords.state[i] = vifelse(!good_momenta & alive_at_start, STATE_LOST, coords.state[i])
+    alive = (coords.state[i] == STATE_ALIVE)
+    ps2_1 = one(ps2)
+    ps = sqrt(vifelse(good_momenta, ps2, ps2_1))
 
-  f = Kn0*tan(e)
+    beta_gamma = rel_p/tilde_m
+    beta_gamma2 = beta_gamma*beta_gamma
+    gamma_minus_1 = beta_gamma2/(1 + sqrt(1 + beta_gamma2))
+    gamma = gamma_minus_1 + 1
+    vt_over_rel_p = Lp/pt
+    factor = vt_over_rel_p*Kn0
+    coeff = a*factor*gamma_minus_1*py_0/rel_p2
 
-  if !isnothing(coords.q)
-    b_vec = (-v[i,YI]*f - sign*v[i,XI]*Ksol/2, -v[i,XI]*f - sign*v[i,YI]*Ksol/2, sign*v[i,YI]*Kn0)
-    ax = -v[i,YI]*Ksol/2
-    ay =  v[i,XI]*Ksol/2
-    rotate_spin_field!(i, coords, a, 0, tilde_m, ax, ay, (0, 0, 0), b_vec, 1/2)
-  end
+    o1 = coeff*px_0
+    o2 = coeff*py_0 - a*gamma*factor
+    o3 = coeff*ps
+    q1 = expq((o1, o2, o3), alive)
 
-  new_px = v[i,PXI] + f*v[i,XI]
-  new_py = v[i,PYI] - f*v[i,YI]
-  v[i,PXI] = vifelse(alive, new_px, v[i,PXI])
-  v[i,PYI] = vifelse(alive, new_py, v[i,PYI])
-
-  if !isnothing(coords.q)
-    rotate_spin_field!(i, coords, a, 0, tilde_m, ax, ay, (0, 0, 0), b_vec, 1/2)
+    theta_0 = zero(theta - factor)
+    angle = vifelse(alive, (theta - factor)/2, theta_0)
+    s, c = sincos(angle)
+    q2 = (c, theta_0, s, theta_0)
+    q3 = quat_mul(q2, q1)
+    q4 = quat_mul(q3, q[i,Q0], q[i,QX], q[i,QY], q[i,QZ])
+    q[i,Q0], q[i,QX], q[i,QY], q[i,QZ] = q4
   end
 end
 
@@ -169,27 +187,9 @@ end
   if !isnothing(w)
     rotation!(i, coords, w, 0)
   end
-  linear_bend_fringe!(i, coords, a, tilde_m, 0, Kn0, e1, 1)
-  exact_bend!(i, coords, theta, g, Kn0, tilde_m, beta_0, L)
-  linear_bend_fringe!(i, coords, a, tilde_m, 0, Kn0, e2, -1)
-  if !isnothing(w_inv)
-    rotation!(i, coords, w_inv, 0)
-  end
-end
-
-
-# This is separate because the spin can be transported exactly here
-@makekernel function exact_curved_drift!(i, coords::Coords, s, e1, e2, g, w, w_inv, a, tilde_m, beta_0, L) 
-  if !isnothing(w)
-    rotation!(i, coords, w, 0)
-  end
-  if !isnothing(coords.q)
-    rotate_spin!(i, coords, a, g, tilde_m, SA[0], SA[0], SA[0], L / 2)
-  end
-  exact_bend!(i, coords, g*L, g, 0, tilde_m, beta_0, L)
-  if !isnothing(coords.q)
-    rotate_spin!(i, coords, a, g, tilde_m, SA[0], SA[0], SA[0], L / 2)
-  end
+  fringe!(i, coords, a, tilde_m, Kn0, nothing, nothing, e1, e2, 1)
+  exact_bend!(i, coords, theta, g, Kn0, tilde_m, beta_0, a, L)
+  fringe!(i, coords, a, tilde_m, Kn0, nothing, nothing, e1, e2, -1)
   if !isnothing(w_inv)
     rotation!(i, coords, w_inv, 0)
   end

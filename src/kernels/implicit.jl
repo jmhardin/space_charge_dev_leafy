@@ -1,39 +1,30 @@
-function implicit_integrator!(i, coords::Coords, s, radiation_params, beta_0, tilde_m, a, g, w, w_inv, potential_and_jac::U, potential_params, p_over_q_ref, normalized, L) where {U}
-  @inbounds begin
+function implicit_integrator!(i, coords::Coords, s, radiation_params, beta_0, tilde_m, a, g, w, w_inv, potential_and_jac::U, potential_params, p_over_q_ref, normalized, implicit_use_newton, L) where {U}
+  @inbounds begin @FastGTPSA begin
+    s += L / 2
+
     if !isnothing(w)
       rotation!(i, coords, w, 0)
     end
 
-    s += L / 2
-
-    if !isnothing(radiation_params)
-      q, mc2, E_ref = radiation_params
-      deterministic_radiation_implicit!(i, coords, s, q, mc2, E_ref, g, potential_and_jac, potential_params, p_over_q_ref, normalized, L / 2)
+    if !isnothing(radiation_params) || !isnothing(coords.q)
+      deterministic_radiation_and_spin_implicit!(i, coords, s, radiation_params, a, g, beta_0, tilde_m, potential_and_jac, potential_params, p_over_q_ref, normalized, Val{true}(), L / 2)
     end
 
-    if !isnothing(coords.q)
-      rotate_spin_implicit!(i, coords, s, a, g, beta_0, tilde_m, potential_and_jac, potential_params, p_over_q_ref, normalized, L / 2)
-    end
+    implicit_step!(i, coords, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, normalized, implicit_use_newton, L)
 
-    implicit_step!(i, coords, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, normalized, L)
-
-    if !isnothing(coords.q)
-      rotate_spin_implicit!(i, coords, s, a, g, beta_0, tilde_m, potential_and_jac, potential_params, p_over_q_ref, normalized, L / 2)
-    end
-
-    if !isnothing(radiation_params)
-      deterministic_radiation_implicit!(i, coords, s, q, mc2, E_ref, g, potential_and_jac, potential_params, p_over_q_ref, normalized, L / 2)
+    if !isnothing(radiation_params) || !isnothing(coords.q)
+      deterministic_radiation_and_spin_implicit!(i, coords, s, radiation_params, a, g, beta_0, tilde_m, potential_and_jac, potential_params, p_over_q_ref, normalized, Val{false}(), L / 2)
     end
 
     if !isnothing(w_inv)
       rotation!(i, coords, w_inv, 0)
     end
-  end
+  end end
   return nothing
 end
 
 
-function implicit_step!(i, coords::Coords, s, beta_0, tilde_m, g, potential_and_jac::U, potential_params, p_over_q_ref, ::Val{normalized}, ds) where {U, normalized}
+function implicit_step!(i, coords::Coords, s, beta_0, tilde_m, g, potential_and_jac::U, potential_params, p_over_q_ref, ::Val{normalized}, ::Val{implicit_use_newton}, ds) where {U, normalized, implicit_use_newton}
   @inbounds begin
     v = coords.v
     T = typeof(scalar(v[i,XI]))
@@ -42,10 +33,20 @@ function implicit_step!(i, coords::Coords, s, beta_0, tilde_m, g, potential_and_
     v_orig::NTuple{6,T} = (scalar(v[i,XI]), scalar(v[i,PXI]), scalar(v[i,YI]), scalar(v[i,PYI]), scalar(v[i,ZI]), scalar(v[i,PZI]))
     v_new::NTuple{6,T} = v_orig
 
+    if implicit_use_newton
+      find_root_x = find_root_x_newton
+      find_root_p = find_root_p_newton
+    else
+      find_root_x = find_root_x_fp
+      find_root_p = find_root_p_fp
+    end
+
     x_new::NTuple{3,T} = find_root_x(i, coords, v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), ds/2)
     v_new = (x_new[1], v_new[PXI], x_new[2], v_new[PYI], x_new[3], v_new[PZI])
 
-    p_new::NTuple{3,T} = (v_new[PXI], v_new[PYI], v_new[PZI]) .- (ds/2 .* dH_dx(v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{true}()))
+    x_deriv, good_momenta = dH_dx(v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{true}())
+    coords.state[i] = vifelse(!good_momenta & alive_at_start, STATE_LOST, coords.state[i])
+    p_new::NTuple{3,T} = (v_new[PXI], v_new[PYI], v_new[PZI]) .- (ds/2 .* x_deriv)
     v_new = (v_new[XI], p_new[1], v_new[YI], p_new[2], v_new[ZI], p_new[3])
 
     if TPSAInterface.is_tps_type(eltype(v)) == TPSAInterface.IsTPSType()
@@ -63,8 +64,8 @@ function implicit_step!(i, coords::Coords, s, beta_0, tilde_m, g, potential_and_
       TPSAInterface.seti!(f[PYI], v_orig[PYI], 0)
       TPSAInterface.seti!(f[PZI], v_orig[PZI], 0)
 
-      d1 = ds/2 .* dH_dx(f, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())
-      d2 = ds/2 .* dH_dp(f, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())
+      d1 = ds/2 .* dH_dx(f, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())[1]
+      d2 = ds/2 .* dH_dp(f, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())[1]
     
       f[XI]  = f[XI]  - v_orig[XI] - d2[1]
       f[YI]  = f[YI]  - v_orig[YI] - d2[2]
@@ -104,9 +105,9 @@ function implicit_step!(i, coords::Coords, s, beta_0, tilde_m, g, potential_and_
         A = SA[hess[1] hess[2] hess[3];
                hess[4] hess[5] hess[6];
                hess[7] hess[8] hess[9]]
-        B = ds/2 .* ForwardDiff.jacobian(p -> SVector{3}(dH_dp(SA[vx, p[1], vy, p[2], vz, p[3]], s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())), 
+        B = ds/2 .* ForwardDiff.jacobian(p -> SVector{3}(dH_dp(SA[vx, p[1], vy, p[2], vz, p[3]], s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())[1]), 
         SA[vpx, vpy, vpz])
-        C = ds/2 .* ForwardDiff.jacobian(x -> SVector{3}(dH_dx(SA[x[1], vpx, x[2], vpy, x[3], vpz], s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())), 
+        C = ds/2 .* ForwardDiff.jacobian(x -> SVector{3}(dH_dx(SA[x[1], vpx, x[2], vpy, x[3], vpz], s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())[1]), 
         SA[vx, vy, vz])
         A, B, C
       end
@@ -149,10 +150,13 @@ function implicit_step!(i, coords::Coords, s, beta_0, tilde_m, g, potential_and_
     end
 
     v_orig = v_new
+
     p_new = find_root_p(i, coords, v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), ds/2)
     v_new = (v_new[XI], p_new[1], v_new[YI], p_new[2], v_new[ZI], p_new[3])
 
-    x_new = (v_new[XI], v_new[YI], v_new[ZI]) .+ (ds/2 .* dH_dp(v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{true}()))
+    p_deriv, good_momenta = dH_dp(v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{true}())
+    coords.state[i] = vifelse(!good_momenta & alive_at_start, STATE_LOST, coords.state[i])
+    x_new = (v_new[XI], v_new[YI], v_new[ZI]) .+ (ds/2 .* p_deriv)
     v_new = (x_new[1], v_new[PXI], x_new[2], v_new[PYI], x_new[3], v_new[PZI])
 
     if TPSAInterface.is_tps_type(eltype(v)) == TPSAInterface.IsTPSType()
@@ -166,8 +170,8 @@ function implicit_step!(i, coords::Coords, s, beta_0, tilde_m, g, potential_and_
       TPSAInterface.seti!(f[PXI], v_new[PXI], 0)
       TPSAInterface.seti!(f[PYI], v_new[PYI], 0)
       TPSAInterface.seti!(f[PZI], v_new[PZI], 0)
-      d1 = ds/2 .* dH_dx(f, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())
-      d2 = ds/2 .* dH_dp(f, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())
+      d1 = ds/2 .* dH_dx(f, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())[1]
+      d2 = ds/2 .* dH_dp(f, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())[1]
 
       f[XI]  = f[XI]  - v_new[XI]   + d2[1]
       f[YI]  = f[YI]  - v_new[YI]   + d2[2]
@@ -205,9 +209,9 @@ function implicit_step!(i, coords::Coords, s, beta_0, tilde_m, g, potential_and_
         A = SA[hess[1] hess[2] hess[3];
                hess[4] hess[5] hess[6];
                hess[7] hess[8] hess[9]]
-        B = ds/2 .* ForwardDiff.jacobian(p -> SVector{3}(dH_dp(SA[vx, p[1], vy, p[2], vz, p[3]], s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())), 
+        B = ds/2 .* ForwardDiff.jacobian(p -> SVector{3}(dH_dp(SA[vx, p[1], vy, p[2], vz, p[3]], s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())[1]), 
         SA[vpx, vpy, vpz])
-        C = ds/2 .* ForwardDiff.jacobian(x -> SVector{3}(dH_dx(SA[x[1], vpx, x[2], vpy, x[3], vpz], s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())), 
+        C = ds/2 .* ForwardDiff.jacobian(x -> SVector{3}(dH_dx(SA[x[1], vpx, x[2], vpy, x[3], vpz], s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, Val{normalized}(), Val{false}())[1]), 
         SA[vx, vy, vz])
         A, B, C
       end
@@ -245,23 +249,6 @@ function implicit_step!(i, coords::Coords, s, beta_0, tilde_m, g, potential_and_
       v_final = v_new
     end
 
-    t = (s/beta_0 - v_final[ZI])/C_LIGHT
-    potential, _ = potential_and_jac(v_final[XI], v_final[YI], s, t, potential_params)
-    phi, ax, ay, _ = potential
-    if !normalized
-      phi = phi/p_over_q_ref/C_LIGHT
-      ax =  ax/p_over_q_ref
-      ay =  ay/p_over_q_ref
-    else
-      phi = phi/C_LIGHT
-    end
-    rel_p = v_final[PZI] + 1/beta_0 - phi
-    px = v_final[PXI] - ax
-    py = v_final[PYI] - ay
-
-    ps2 = rel_p*rel_p - tilde_m*tilde_m - px*px - py*py
-    good_momenta = (ps2 > 0)
-    coords.state[i] = vifelse(!good_momenta & alive_at_start, STATE_LOST, coords.state[i])
     alive = (coords.state[i] == STATE_ALIVE)
 
     v[i,XI]  = vifelse(alive, v_final[XI],  v[i,XI])
@@ -275,7 +262,7 @@ function implicit_step!(i, coords::Coords, s, beta_0, tilde_m, g, potential_and_
 end
 
 
-function find_root_x(i, coords::Coords, v, s, beta_0, tilde_m, g, potential_and_jac::U, potential_params, p_over_q_ref, normalized, ds) where {U}
+function find_root_x_fp(i, coords::Coords, v, s, beta_0, tilde_m, g, potential_and_jac::U, potential_params, p_over_q_ref, normalized, ds) where {U}
   @inbounds begin
     ε = my_eps(v[1])
     T = eltype(v)
@@ -287,11 +274,61 @@ function find_root_x(i, coords::Coords, v, s, beta_0, tilde_m, g, potential_and_
     conv = (ε*norm_x < 0) # always false but SIMD vector for SIMD vector inputs
     while !all(conv) && N <= N_max
       v_new::NTuple{6,T} = (x[1], v[PXI], x[2], v[PYI], x[3], v[PZI])
-      hess::NTuple{9,T} = mixed_hessian_H(v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, normalized, Val{true}())
-      J = (1 - ds*hess[1],    -ds*hess[4],    -ds*hess[7],
-              -ds*hess[2], 1 - ds*hess[5],    -ds*hess[8],
-              -ds*hess[3],    -ds*hess[6], 1 - ds*hess[9])
-      F::NTuple{3,T} = x .- x0 .- (ds .* dH_dp(v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, normalized, Val{true}()))
+      x_new = x0 .+ (ds .* dH_dp(v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, normalized, Val{true}())[1])
+      diff = x_new .- x
+      norm_diff = sqrt(diff[1]*diff[1] + diff[2]*diff[2] + diff[3]*diff[3])
+      conv = ((norm_diff < ε*norm_x) | (norm_diff < ε))
+      x = x_new
+      N += 1
+    end
+    coords.state[i] = vifelse(!conv & (coords.state[i] == STATE_ALIVE), STATE_IMPLICIT_NONCONVERGENCE, coords.state[i])
+    return x
+  end
+end
+
+
+function find_root_p_fp(i, coords::Coords, v, s, beta_0, tilde_m, g, potential_and_jac::U, potential_params, p_over_q_ref, normalized, ds) where {U}
+  @inbounds begin
+    ε = my_eps(v[1])
+    T = eltype(v)
+    N_max = 100
+    N = 1
+    p::NTuple{3,T}  = (v[PXI], v[PYI], v[PZI])
+    p0::NTuple{3,T} = (v[PXI], v[PYI], v[PZI])
+    norm_p = sqrt(p[1]*p[1] + p[2]*p[2] + p[3]*p[3])
+    conv = (ε*norm_p < 0) # always false but SIMD vector for SIMD vector inputs
+    while !all(conv) && N <= N_max
+      v_new::NTuple{6,T} = (v[XI], p[1], v[YI], p[2], v[ZI], p[3])
+      p_new = p0 .- (ds .* dH_dx(v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, normalized, Val{true}())[1])
+      diff = p_new .- p
+      norm_diff = sqrt(diff[1]*diff[1] + diff[2]*diff[2] + diff[3]*diff[3])
+      conv = ((norm_diff < ε*norm_p) | (norm_diff < ε))
+      p = p_new
+      N += 1
+    end
+    coords.state[i] = vifelse(!conv & (coords.state[i] == STATE_ALIVE), STATE_IMPLICIT_NONCONVERGENCE, coords.state[i])
+    return p
+  end
+end
+
+
+function find_root_x_newton(i, coords::Coords, v, s, beta_0, tilde_m, g, potential_and_jac::U, potential_params, p_over_q_ref, normalized, ds) where {U}
+  @inbounds begin
+    ε = my_eps(v[1])
+    T = eltype(v)
+    N_max = 100
+    N = 1
+    x::NTuple{3,T}  = (v[XI], v[YI], v[ZI])
+    x0::NTuple{3,T} = (v[XI], v[YI], v[ZI])
+    norm_x = sqrt(x[1]*x[1] + x[2]*x[2] + x[3]*x[3])
+    conv = (ε*norm_x < 0) # always false but SIMD vector for SIMD vector inputs
+    while !all(conv) && N <= N_max
+      v_new::NTuple{6,T} = (x[1], v[PXI], x[2], v[PYI], x[3], v[PZI])
+      hess, p_deriv = mixed_hessian_and_dH_dp(v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, normalized, Val{true}())
+      J::NTuple{9,T} = (1 - ds*hess[1],    -ds*hess[4],    -ds*hess[7],
+                           -ds*hess[2], 1 - ds*hess[5],    -ds*hess[8],
+                           -ds*hess[3],    -ds*hess[6], 1 - ds*hess[9])
+      F::NTuple{3,T} = x .- x0 .- (ds .* p_deriv)
       norm_F = sqrt(F[1]*F[1] + F[2]*F[2] + F[3]*F[3])
       sol = solve_3x3_cramer(J, -1 .* F)
       norm_sol = sqrt(sol[1]*sol[1] + sol[2]*sol[2] + sol[3]*sol[3])
@@ -305,7 +342,7 @@ function find_root_x(i, coords::Coords, v, s, beta_0, tilde_m, g, potential_and_
 end
 
 
-function find_root_p(i, coords::Coords, v, s, beta_0, tilde_m, g, potential_and_jac::U, potential_params, p_over_q_ref, normalized, ds) where {U}
+function find_root_p_newton(i, coords::Coords, v, s, beta_0, tilde_m, g, potential_and_jac::U, potential_params, p_over_q_ref, normalized, ds) where {U}
   @inbounds begin
     ε = my_eps(v[1])
     T = eltype(v)
@@ -317,11 +354,11 @@ function find_root_p(i, coords::Coords, v, s, beta_0, tilde_m, g, potential_and_
     conv = (ε*norm_p < 0) # always false but SIMD vector for SIMD vector inputs
     while !all(conv) && N <= N_max
       v_new::NTuple{6,T} = (v[XI], p[1], v[YI], p[2], v[ZI], p[3])
-      hess::NTuple{9,T} = mixed_hessian_H(v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, normalized, Val{true}())
-      J = (1 + ds*hess[1],     ds*hess[2],     ds*hess[3],
-               ds*hess[4], 1 + ds*hess[5],     ds*hess[6],
-               ds*hess[7],     ds*hess[8], 1 + ds*hess[9])
-      F::NTuple{3,T} = p .- p0 .+ (ds .* dH_dx(v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, normalized, Val{true}()))
+      hess, x_deriv = mixed_hessian_and_dH_dx(v_new, s, beta_0, tilde_m, g, potential_and_jac, potential_params, p_over_q_ref, normalized, Val{true}())
+      J::NTuple{9,T} = (1 + ds*hess[1],     ds*hess[2],     ds*hess[3],
+                            ds*hess[4], 1 + ds*hess[5],     ds*hess[6],
+                            ds*hess[7],     ds*hess[8], 1 + ds*hess[9])
+      F::NTuple{3,T} = p .- p0 .+ (ds .* x_deriv)
       norm_F = sqrt(F[1]*F[1] + F[2]*F[2] + F[3]*F[3])
       sol = solve_3x3_cramer(J, -1 .* F)
       norm_sol = sqrt(sol[1]*sol[1] + sol[2]*sol[2] + sol[3]*sol[3])
@@ -379,9 +416,9 @@ function dH_dx(v, s, beta_0, tilde_m, g, potential_and_jac::U, potential_params,
     dH_dz = h*(rel_p*dphi_dz - px*dax_dz - py*day_dz)/ps - daz_dz
 
     if scalarize
-      return (scalar(dH_dx), scalar(dH_dy), scalar(dH_dz))
+      return (scalar(dH_dx), scalar(dH_dy), scalar(dH_dz)), good_momenta
     else
-      return (dH_dx, dH_dy, dH_dz)
+      return (dH_dx, dH_dy, dH_dz), good_momenta
     end
   end
 end
@@ -418,9 +455,9 @@ function dH_dp(v, s, beta_0, tilde_m, g, potential_and_jac::U, potential_params,
     dH_dpz = -h*rel_p/ps + 1/beta_0
     
     if scalarize
-      return (scalar(dH_dpx), scalar(dH_dpy), scalar(dH_dpz))
+      return (scalar(dH_dpx), scalar(dH_dpy), scalar(dH_dpz)), good_momenta
     else
-      return (dH_dpx, dH_dpy, dH_dpz)
+      return (dH_dpx, dH_dpy, dH_dpz), good_momenta
     end
   end
 end
@@ -495,6 +532,150 @@ function mixed_hessian_H(v, s, beta_0, tilde_m, g, potential_and_jac::U, potenti
 end
 
 
+function mixed_hessian_and_dH_dx(v, s, beta_0, tilde_m, g, potential_and_jac::U, potential_params, p_over_q_ref, ::Val{normalized}, ::Val{scalarize}) where {U, normalized, scalarize}
+  @inbounds begin
+    h = 1 + g*v[XI]
+    t = (s/beta_0 - v[ZI])/C_LIGHT
+
+    potential, derivatives = potential_and_jac(v[XI], v[YI], s, t, potential_params)
+    phi, ax, ay, az = potential
+    if !normalized
+      phi = phi/p_over_q_ref/C_LIGHT
+      ax =  ax/p_over_q_ref
+      ay =  ay/p_over_q_ref
+      az =  az/p_over_q_ref
+
+      dphi_dx, dax_dx, day_dx, daz_dx = derivatives[1]/p_over_q_ref/C_LIGHT, derivatives[5]/p_over_q_ref, derivatives[9]/p_over_q_ref, derivatives[13]/p_over_q_ref
+      dphi_dy, dax_dy, day_dy, daz_dy = derivatives[2]/p_over_q_ref/C_LIGHT, derivatives[6]/p_over_q_ref, derivatives[10]/p_over_q_ref, derivatives[14]/p_over_q_ref
+      dphi_dt, dax_dt, day_dt, daz_dt = derivatives[4]/p_over_q_ref/C_LIGHT, derivatives[8]/p_over_q_ref, derivatives[12]/p_over_q_ref, derivatives[16]/p_over_q_ref
+    else
+      phi = phi/C_LIGHT
+      dphi_dx, dax_dx, day_dx, daz_dx = derivatives[1]/C_LIGHT, derivatives[5], derivatives[9], derivatives[13]
+      dphi_dy, dax_dy, day_dy, daz_dy = derivatives[2]/C_LIGHT, derivatives[6], derivatives[10], derivatives[14]
+      dphi_dt, dax_dt, day_dt, daz_dt = derivatives[4]/C_LIGHT, derivatives[8], derivatives[12], derivatives[16]
+    end
+    dphi_dz = -dphi_dt/C_LIGHT
+    dax_dz =  -dax_dt/C_LIGHT
+    day_dz =  -day_dt/C_LIGHT
+    daz_dz =  -daz_dt/C_LIGHT
+
+    px = v[PXI] - ax
+    py = v[PYI] - ay
+    rel_p = v[PZI] + 1/beta_0 - phi
+    
+    ps2 = rel_p*rel_p - tilde_m*tilde_m - px*px - py*py
+    good_momenta = (ps2 > 0)
+    ps2_1 = one(ps2)
+    ps = sqrt(vifelse(good_momenta, ps2, ps2_1))
+    h_over_ps3 = h/(ps2*ps)
+
+    middle_factor_x = h_over_ps3*(rel_p*dphi_dx - px*dax_dx - py*day_dx)
+    middle_factor_y = h_over_ps3*(rel_p*dphi_dy - px*dax_dy - py*day_dy)
+    middle_factor_z = h_over_ps3*(rel_p*dphi_dz - px*dax_dz - py*day_dz)
+
+    d2H_dxdpx = px*middle_factor_x - h*dax_dx/ps + g*px/ps
+    d2H_dxdpy = py*middle_factor_x - h*day_dx/ps + g*py/ps
+    d2H_dxdpz = -rel_p*middle_factor_x + h*dphi_dx/ps - g*rel_p/ps
+
+    d2H_dydpx = px*middle_factor_y - h*dax_dy/ps
+    d2H_dydpy = py*middle_factor_y - h*day_dy/ps
+    d2H_dydpz = -rel_p*middle_factor_y + h*dphi_dy/ps
+
+    d2H_dzdpx = px*middle_factor_z - h*dax_dz/ps
+    d2H_dzdpy = py*middle_factor_z - h*day_dz/ps
+    d2H_dzdpz = -rel_p*middle_factor_z + h*dphi_dz/ps
+
+    dH_dx = h*(rel_p*dphi_dx - px*dax_dx - py*day_dx)/ps - daz_dx - g*ps
+    dH_dy = h*(rel_p*dphi_dy - px*dax_dy - py*day_dy)/ps - daz_dy
+    dH_dz = h*(rel_p*dphi_dz - px*dax_dz - py*day_dz)/ps - daz_dz
+
+    if scalarize
+      return (scalar(d2H_dxdpx), scalar(d2H_dxdpy), scalar(d2H_dxdpz), 
+              scalar(d2H_dydpx), scalar(d2H_dydpy), scalar(d2H_dydpz), 
+              scalar(d2H_dzdpx), scalar(d2H_dzdpy), scalar(d2H_dzdpz)),
+              (scalar(dH_dx), scalar(dH_dy), scalar(dH_dz))
+    else
+      return (d2H_dxdpx, d2H_dxdpy, d2H_dxdpz, 
+              d2H_dydpx, d2H_dydpy, d2H_dydpz, 
+              d2H_dzdpx, d2H_dzdpy, d2H_dzdpz),
+              (dH_dx, dH_dy, dH_dz)
+    end
+  end
+end
+
+
+function mixed_hessian_and_dH_dp(v, s, beta_0, tilde_m, g, potential_and_jac::U, potential_params, p_over_q_ref, ::Val{normalized}, ::Val{scalarize}) where {U, normalized, scalarize}
+  @inbounds begin
+    h = 1 + g*v[XI]
+    t = (s/beta_0 - v[ZI])/C_LIGHT
+
+    potential, derivatives = potential_and_jac(v[XI], v[YI], s, t, potential_params)
+    phi, ax, ay, az = potential
+    if !normalized
+      phi = phi/p_over_q_ref/C_LIGHT
+      ax =  ax/p_over_q_ref
+      ay =  ay/p_over_q_ref
+      az =  az/p_over_q_ref
+
+      dphi_dx, dax_dx, day_dx, daz_dx = derivatives[1]/p_over_q_ref/C_LIGHT, derivatives[5]/p_over_q_ref, derivatives[9]/p_over_q_ref, derivatives[13]/p_over_q_ref
+      dphi_dy, dax_dy, day_dy, daz_dy = derivatives[2]/p_over_q_ref/C_LIGHT, derivatives[6]/p_over_q_ref, derivatives[10]/p_over_q_ref, derivatives[14]/p_over_q_ref
+      dphi_dt, dax_dt, day_dt, daz_dt = derivatives[4]/p_over_q_ref/C_LIGHT, derivatives[8]/p_over_q_ref, derivatives[12]/p_over_q_ref, derivatives[16]/p_over_q_ref
+    else
+      phi = phi/C_LIGHT
+      dphi_dx, dax_dx, day_dx, daz_dx = derivatives[1]/C_LIGHT, derivatives[5], derivatives[9], derivatives[13]
+      dphi_dy, dax_dy, day_dy, daz_dy = derivatives[2]/C_LIGHT, derivatives[6], derivatives[10], derivatives[14]
+      dphi_dt, dax_dt, day_dt, daz_dt = derivatives[4]/C_LIGHT, derivatives[8], derivatives[12], derivatives[16]
+    end
+    dphi_dz = -dphi_dt/C_LIGHT
+    dax_dz =  -dax_dt/C_LIGHT
+    day_dz =  -day_dt/C_LIGHT
+    daz_dz =  -daz_dt/C_LIGHT
+
+    px = v[PXI] - ax
+    py = v[PYI] - ay
+    rel_p = v[PZI] + 1/beta_0 - phi
+    
+    ps2 = rel_p*rel_p - tilde_m*tilde_m - px*px - py*py
+    good_momenta = (ps2 > 0)
+    ps2_1 = one(ps2)
+    ps = sqrt(vifelse(good_momenta, ps2, ps2_1))
+    h_over_ps3 = h/(ps2*ps)
+
+    middle_factor_x = h_over_ps3*(rel_p*dphi_dx - px*dax_dx - py*day_dx)
+    middle_factor_y = h_over_ps3*(rel_p*dphi_dy - px*dax_dy - py*day_dy)
+    middle_factor_z = h_over_ps3*(rel_p*dphi_dz - px*dax_dz - py*day_dz)
+
+    d2H_dxdpx = px*middle_factor_x - h*dax_dx/ps + g*px/ps
+    d2H_dxdpy = py*middle_factor_x - h*day_dx/ps + g*py/ps
+    d2H_dxdpz = -rel_p*middle_factor_x + h*dphi_dx/ps - g*rel_p/ps
+
+    d2H_dydpx = px*middle_factor_y - h*dax_dy/ps
+    d2H_dydpy = py*middle_factor_y - h*day_dy/ps
+    d2H_dydpz = -rel_p*middle_factor_y + h*dphi_dy/ps
+
+    d2H_dzdpx = px*middle_factor_z - h*dax_dz/ps
+    d2H_dzdpy = py*middle_factor_z - h*day_dz/ps
+    d2H_dzdpz = -rel_p*middle_factor_z + h*dphi_dz/ps
+
+    dH_dpx =  h*px/ps
+    dH_dpy =  h*py/ps
+    dH_dpz = -h*rel_p/ps + 1/beta_0
+
+    if scalarize
+      return (scalar(d2H_dxdpx), scalar(d2H_dxdpy), scalar(d2H_dxdpz), 
+              scalar(d2H_dydpx), scalar(d2H_dydpy), scalar(d2H_dydpz), 
+              scalar(d2H_dzdpx), scalar(d2H_dzdpy), scalar(d2H_dzdpz)),
+              (scalar(dH_dpx), scalar(dH_dpy), scalar(dH_dpz))
+    else
+      return (d2H_dxdpx, d2H_dxdpy, d2H_dxdpz, 
+              d2H_dydpx, d2H_dydpy, d2H_dydpz, 
+              d2H_dzdpx, d2H_dzdpy, d2H_dzdpz),
+              (dH_dpx, dH_dpy, dH_dpz)
+    end
+  end
+end
+
+
 """
 Solves Ax = y for x using Cramer's rule, where A is a 3x3 matrix and y is a 3-vector.
 """
@@ -552,12 +733,11 @@ end
 
 
 """
-Rotates spin for implicit integrators.
+Rotates spins and applies radiation damping kicks for implicit integrators.
 """
-function rotate_spin_implicit!(i, coords::Coords, s, a, g, beta_0, tilde_m, potential_and_jac::U, potential_params, p_over_q_ref, normalized, L) where {U}
+function deterministic_radiation_and_spin_implicit!(i, coords, s, radiation_params, a, g, beta_0, tilde_m, potential_and_jac::U, potential_params, p_over_q_ref, normalized, ::Val{rad_first}, L) where {U, rad_first}
   @inbounds begin @FastGTPSA begin
     v = coords.v
-
     t = (s/beta_0 - v[i,ZI])/C_LIGHT
 
     phi, ax, ay, ex, ey, ez, bx, by, bz = implicit_fields(v[i,XI], v[i,YI], s, t, g, potential_and_jac, potential_params, p_over_q_ref, normalized)
@@ -565,29 +745,24 @@ function rotate_spin_implicit!(i, coords::Coords, s, a, g, beta_0, tilde_m, pote
     b_vec = (bx, by, bz)
 
     mad_to_bmad!(i, coords, beta_0, tilde_m, phi)
-    rotate_spin_field!(i, coords, a, g, tilde_m, ax, ay, e_vec, b_vec, L)
+    if rad_first
+      if !isnothing(radiation_params)
+        q, mc2, E_ref = radiation_params
+        deterministic_radiation_field!(i, coords, q, mc2, E_ref, g, ax, ay, e_vec, b_vec, L)
+      end
+      if !isnothing(coords.q)
+        rotate_spin_field!(i, coords, a, g, tilde_m, ax, ay, e_vec, b_vec, L)
+      end
+    else
+      if !isnothing(coords.q)
+        rotate_spin_field!(i, coords, a, g, tilde_m, ax, ay, e_vec, b_vec, L)
+      end
+      if !isnothing(radiation_params)
+        q, mc2, E_ref = radiation_params
+        deterministic_radiation_field!(i, coords, q, mc2, E_ref, g, ax, ay, e_vec, b_vec, L)
+      end
+    end
     bmad_to_mad!(i, coords, beta_0, tilde_m, phi)
-  end end
-  return nothing
-end
-
-
-""" 
-Applies radiation damping kick for implicit integrators.
-"""
-function deterministic_radiation_implicit!(i, coords::Coords, s, q, mc2, E_ref, g, potential_and_jac::U, potential_params, p_over_q_ref, normalized, L) where {U}
-  @inbounds begin @FastGTPSA begin
-    v = coords.v
-    t = (s - v[i,ZI])/C_LIGHT # radiation is only accurate when beta_0 is approximately 1
-    tilde_m = mc2/E_ref
-
-    phi, ax, ay, ex, ey, ez, bx, by, bz = implicit_fields(v[i,XI], v[i,YI], s, t, g, potential_and_jac, potential_params, p_over_q_ref, normalized)
-    e_vec = (ex, ey, ez)
-    b_vec = (bx, by, bz)
-
-    mad_to_bmad!(i, coords, 1, tilde_m, phi)
-    deterministic_radiation_field!(i, coords, q, mc2, E_ref, g, ax, ay, e_vec, b_vec, L) 
-    bmad_to_mad!(i, coords, 1, tilde_m, phi)
   end end
   return nothing
 end
@@ -613,6 +788,7 @@ function stochastic_radiation!(i, coords::Coords, s, ::typeof(implicit_integrato
   return nothing
 end
 
+
 function callback_implicit!(i, coords, cur_s, cur_t_ref, beta_0, tilde_m, potential_and_jac, potential_params, p_over_q_ref, ::Val{normalized}, ::Val{in}) where {normalized,in}
   @inbounds begin @FastGTPSA begin
     v = coords.v
@@ -634,9 +810,11 @@ function callback_implicit!(i, coords, cur_s, cur_t_ref, beta_0, tilde_m, potent
   end end
 end
 
+
 scalar(x::TPS) = TPSAInterface.scalar(x)
 scalar(x::ForwardDiff.Dual) = ForwardDiff.value(x)
 scalar(x) = x
+
 
 my_eps(::SIMD.Vec{N,T}) where {N,T} = eps(T)
 my_eps(::T) where {T} = eps(T)
