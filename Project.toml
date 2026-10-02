@@ -23,6 +23,8 @@ StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 TPSAInterface = "575459ea-959c-4603-9b15-d63fb6693033"
 Unrolled = "9602ed7d-8fef-5bc8-8597-8f21381861e8"
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
 
 [weakdeps]
 Beamlines = "5bb90b03-0719-46b8-8ce4-1ef3afd3cd4b"
@@ -53,7 +55,8 @@ Statistics = "1"
 TPSAInterface = "0.3.0"
 Unrolled = "0.1.5"
 julia = "1.10"
-
+FFTW = ">= 1.10.0"
+LoopVectorization = ">= 0.12.174"
 [extras]
 Beamlines = "5bb90b03-0719-46b8-8ce4-1ef3afd3cd4b"
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"

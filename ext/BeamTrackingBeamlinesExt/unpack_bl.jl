@@ -1,4 +1,307 @@
 # Step 1: Unpack the element ---------------------------------------------
+using Statistics
+using FFTW
+using LoopVectorization
+
+const XI  = 1
+const PXI = 2
+const YI  = 3
+const PYI = 4
+const ZI  = 5
+const PZI = 6
+
+using SIMD
+"""
+Claude attempt at a complex SIMD:
+"""
+struct CVec{N,T}
+    re::Vec{N,T}
+    im::Vec{N,T}
+end
+
+struct CVec{V}
+    re::V
+    im::V
+end
+
+Base.:+(a::CVec, b::CVec) = CVec(a.re + b.re, a.im + b.im)
+Base.:-(a::CVec, b::CVec) = CVec(a.re - b.re, a.im - b.im)
+Base.:-(a::CVec) = CVec(-a.re, -a.im)
+Base.:*(a::CVec, b::CVec) =
+    CVec(muladd(a.re, b.re, -(a.im * b.im)),
+         muladd(a.re, b.im,  a.im * b.re))
+Base.:*(a::Real, b::CVec) = CVec(a * b.re, a * b.im)
+Base.:*(a::CVec, b::Real) = CVec(a.re * b, a.im * b)
+Base.:*(a::CVec{V}, b::V) where {V} = CVec(a.re * b, a.im * b)
+Base.:*(a::V, b::CVec{V}) where {V} = CVec(a * b.re, a * b.im)
+Base.:+(a::CVec{V}, b::V) where {V} = CVec(a.re + b, a.im)
+Base.:+(a::V, b::CVec{V}) where {V} = CVec(a + b.re, b.im)
+Base.:+(a::Real, b::CVec{V}) where {V} = CVec(a + b.re, b.im)
+Base.:+(a::CVec{V}, b::Real) where {V} = CVec(a.re + b, a.im)
+Base.:-(a::CVec{V}, b::V) where {V} = CVec(a.re - b, a.im)
+Base.:-(a::V, b::CVec{V}) where {V} = CVec(a - b.re, -b.im)
+Base.:-(a::Real, b::CVec{V}) where {V} = CVec(a - b.re, -b.im)
+Base.:-(a::CVec{V}, b::Real) where {V} = CVec(a.re - b, a.im)
+
+Base.:/(a::CVec{V}, b::V) where {V} = CVec(a.re / b, a.im / b)
+
+Base.conj(a::CVec)        = CVec(a.re, -a.im)
+
+@inline function cexp(z::CVec)
+    m = exp(z.re)
+    CVec(m * cos(z.im), m * sin(z.im))
+end
+
+# zero(::CVec) / zero(::Type{CVec{V}}) for both cases:
+Base.zero(::CVec{V}) where {V} = CVec(zero(V), zero(V))
+Base.zero(::Type{CVec{V}}) where {V} = CVec(zero(V), zero(V))
+
+# vifelse: SIMD.jl defines vifelse(::Vec{N,Bool}, ::Vec, ::Vec);
+# add the scalar (Bool) version so the same call works in both paths:
+SIMD.vifelse(m::Vec{N,Bool}, a::CVec{V}, b::CVec{V}) where {N,V} =
+    CVec(vifelse(m, a.re, b.re), vifelse(m, a.im, b.im))
+SIMD.vifelse(m::Bool, a::CVec{T}, b::CVec{T}) where {T<:Real} =
+    m ? a : b
+
+@inline function Base.inv(z::CVec)
+    d = muladd(z.re, z.re, z.im * z.im)
+    CVec(z.re / d, -z.im / d)
+end
+
+@inline im_mul(z::CVec) = CVec(-z.im, z.re)
+
+function vmap!(f, outre::Vector{T}, outim::Vector{T},
+               xs::NTuple{K,Tuple{Vector{T},Vector{T}}}; N::Int = 4) where {T,K}
+    n = length(outre)
+    V = Vec{N,T}
+    i = 1
+    @inbounds while i + N - 1 <= n
+        vs = ntuple(k -> CVec(vload(V, xs[k][1], i), vload(V, xs[k][2], i)), K)
+        r  = f(vs...)
+        vstore(r.re, outre, i); vstore(r.im, outim, i)
+        i += N
+    end
+    @inbounds while i <= n
+        vs = ntuple(k -> CVec(xs[k][1][i], xs[k][2][i]), K)   # scalar CVec now!
+        r  = f(vs...)                                          # same `f`, e.g. fw
+        outre[i], outim[i] = r.re, r.im
+        i += 1
+    end
+    return outre, outim
+end
+
+
+
+@inline faddeeva(z) = faddeeva(z, Val(48))
+
+@inline function __faddeeva_coeff(n, type::Type=Float64)
+  N = n
+  M = 2*N
+  L = sqrt(N/sqrt(type(2)))
+  theta_arr = [k*type(pi)/M for k in (-M+1):(M-1)]
+  t_arr = L*tan.(theta_arr/2)
+  f_arr = [(L^2 + t^2)*exp(-t^2) for t in t_arr]
+  f_arr = vcat(zero(type), f_arr)
+  a_arr = real.(fft(fftshift(f_arr)))/(2*M)
+  return a_arr[2:(N+1)], L
+end
+
+@generated function faddeeva_bak2(z::CVec{V}, ::Val{M}) where {V,M}
+    T = V <: Vec ? eltype(V) : V
+    a_arr, L = __faddeeva_coeff(M, T)
+    a_arr = reverse(a_arr)
+    ex = :($(a_arr[1]))
+    for i in 2:M
+        ex = :($ex * Z + $(a_arr[i]))
+    end
+    invsqrtpi = 1 / sqrt(T(pi))
+    return quote
+        mask = z.im >= zero($V)
+        c2   = vifelse(mask, one($V), -one($V))
+        zr   = z * c2
+
+        lmiz_inv = inv($L - im_mul(zr))
+        Z    = ($L + im_mul(zr)) * lmiz_inv
+
+        base = (2*$ex*lmiz_inv + $invsqrtpi) * lmiz_inv
+        expo = 2*cexp(-(zr*zr))
+
+        return vifelse(mask, base, expo - base)
+    end
+end
+@generated function faddeeva(z::CVec{V}, ::Val{M}) where {V,M}
+    T = V <: Vec ? eltype(V) : V
+    a_arr, L = __faddeeva_coeff(M, T)
+    a_arr = reverse(a_arr)
+    ex = :($(a_arr[1]))
+    for i in 2:M
+        ex = :(muladd($ex, Z, $(a_arr[i])))
+    end
+    return quote
+        mask = z.im >= zero($V)
+        c1   = vifelse(mask, one($V), zero($V))
+        c2   = vifelse(mask, one($V), -one($V))
+        z = c2*z
+        lmiz_inv =inv($L - im_mul(z))
+        Z = ($L + im_mul(z))*lmiz_inv
+        return c1*2*cexp(-(z*z)) + c2*(2*$ex*lmiz_inv + $(1/sqrt(T(pi))))*lmiz_inv
+    end
+end
+
+@generated function faddeeva(z::Complex{T}, ::Val{N}) where {T,N}
+  a_arr, L = __faddeeva_coeff(N, T)
+  a_arr = reverse(a_arr)
+  ex = :($(a_arr[1]))
+  for i in 2:N
+    ex = :(muladd($ex, Z, $(a_arr[i])))
+  end
+  return quote
+    c1 = imag(z) >= 0 ? 0 : 1
+    c2 = 1 - 2*c1
+    z = c2*z
+    lmiz_inv = 1/($L - im*z)
+    Z = ($L + im*z)*lmiz_inv
+    return c1*2*exp(-z^2) + c2*(2*$ex*lmiz_inv + $(1/sqrt(T(pi))))*lmiz_inv
+  end
+end
+
+
+@inline function gaus_space_charge_kick!(i, coords::Coords,means,sigmas,L,N,locXI,locYI,locPXI,locPYI)
+    #println(means)
+    v = coords.v
+    
+    X =   v[i,locXI]  - means[locXI]
+    Y =   v[i,locYI]  - means[locYI]
+    Z =   v[i,ZI]  - means[ZI] 
+    #PX =  v[i,PXI] - means[PXI]
+    #PY =  v[i,PYI] - means[PYI]
+    PZ =  v[i,PZI]
+    
+    sig_x = sigmas[locXI,locXI]
+    sig_y = sigmas[locYI,locYI]
+    sig_z = sigmas[ZI,ZI]
+    sig_x = sqrt(abs(sig_x))
+    sig_y = sqrt(abs(sig_y))
+    sig_z = sqrt(abs(sig_z))
+    r_sq = X*X + Y*Y
+    r = sqrt(r_sq)
+    #precompute this later? Depends on particle...
+    #gamma = sqrt(5.11e5*5.11e5 + PZ*PZ)/5.11e5
+    gamma = sqrt(5.11e5*5.11e5 + means[PZI]*means[PZI])/5.11e5
+
+    beta = sqrt(1 - 1/(gamma*gamma))#this REALLY wants precomputation, or at least taylor expansion
+    #assume none are moving backwards in lab frame
+    
+    #Differential Q/z - oth order assuming infinite cylinder at z position
+    #Consider mathamaticaing everything properly
+    z_dens = N*exp(-Z*Z/(2*sig_z*sig_z))/(sig_z*sqrt(2*pi))
+    #precompute
+    #Why are these negative sometimes????
+    sig_sq = sig_x*sig_x + sig_y*sig_y
+
+    sig_x2 = sig_x*sig_x
+    sig_y2 = sig_y*sig_y
+    
+    k = 1.44e-9 #ev-m
+
+    #These can't be complex by construction
+    #sig_denom = Complex(sig_x*sig_x-sig_y*sig_y)
+    #A = sqrt(Complex(sqrt(2*pi)*k/sig_denom))
+    sig_denom = sig_x*sig_x-sig_y*sig_y
+    A = k*sqrt(2*pi/sig_denom)
+    #=
+    print(k)
+    print(" ")
+    print(sig_x)
+    print(" ")
+    print(sig_y)
+    print(" ")
+    print(sig_z)
+    print(" ")
+    println(sig_denom)
+    =#
+    
+    
+    #-------
+    #argB = Complex(X,Y)
+    B = faddeeva(CVec(X/sqrt(2*sig_denom), Y/sqrt(2*sig_denom)))
+
+    C = faddeeva(CVec(X*sig_y/sig_x/sqrt(2*sig_denom),Y*sig_x/sig_y/sqrt(2*sig_denom)))
+    
+    expD = exp(-X*X/(2*sig_x2) - Y*Y/(2*sig_y2))
+    
+    
+    #=
+    #print(A)
+    print(" ")
+    print(B)
+    print(" ")
+    #print(C)
+    print(" ")
+    #print(expD)
+    println("")
+    =#
+    #force
+    result = z_dens*A*(B - expD*C)
+    mask = C.im != C.im
+    mask2 = C.re != C.re
+    #=
+    println(mask)
+    println(mask2)
+    println(X*sig_y/sig_x/sqrt(2*sig_denom))
+    println(Y*sig_x/sig_y/sqrt(2*sig_denom))
+    println(Y)
+    println(sig_x)
+    println(sig_y)
+    println(sig_denom)
+    =#
+    proper_time = L/(beta*gamma)
+    #impulse
+    result = result*proper_time
+
+    #force
+    #result_real = z_dens*A*(Bu - expD*Cu)
+    #result_imag = z_dens*A*(Bv - expD*Cu)
+    #proper_time = L/(beta*gamma)
+    #impulse
+    #result_real = result_real*proper_time
+    #result_imag = result_imag*proper_time
+
+    
+    loc_x_impulse = result.im
+    loc_y_impulse = result.re
+
+    #loc_x_impulse = result_imag
+    #loc_y_impulse = result_real
+    v[i,locPXI] = v[i,locPXI] + loc_x_impulse
+    v[i,locPYI] = v[i,locPYI] + loc_y_impulse
+end
+@inline function gaus_space_charge(kc, bunch, L)
+  backend = get_backend(bunch.coords.v)
+  means, sigmas = mean_and_cov(bunch.coords.v, bunch.coords.weight, backend)
+  #sigmas = Symmetric(sigmas)
+  #println(sigmas[:,1])
+  #println(sigmas)
+  N = length(bunch.coords.v)/6
+  locXI = XI
+  locYI = YI
+  locPXI = PXI
+  locPYI = PYI
+  #outsigmas = zeros(6)
+  #for i in 1:6
+  #      outsigmas = sigmas[i,i]
+  #end
+  if (sigmas[XI,XI] < sigmas[YI,YI])
+        locXI = YI
+        locYI = XI
+        locPXI = PYI
+        locPYI = PXI
+  end
+  #print(N)
+  return push(kc, make_kernel_call(gaus_space_charge_kick!,(means,sigmas,L,N,locXI,locYI,locPXI,locPYI)))
+end
+
+# Step 1: Unpack the element ---------------------------------------------
 function _track!(
   coords::Coords,
   bunch::Bunch,
@@ -11,7 +314,6 @@ function _track!(
   ramp_update_each_particle;
   kwargs...
 )
-  print("Test HELLO JH")
   # Unpack the line element (type unstable)
   L = float(ele.L) # Automatically calls deval (element-level get)
   # float call is required because L is allowed to be any type
@@ -94,8 +396,10 @@ function universal!(
   # 2 aperture, 2 alignment, 1 body kernel, 1 IBS kernel,
   # 2 kernels to update the particles' reference energy,
   # and 2 for coordinate conversion with implicit
-  kc = KernelChain(Val{10}(), RefState(; t_enter, beta_gamma_enter, t_exit, beta_gamma_exit, L, g, ds_step))
-  
+  kc = KernelChain(Val{11}(), RefState(; t_enter, beta_gamma_enter, t_exit, beta_gamma_exit, L, g, ds_step))
+
+  kc = gaus_space_charge(kc, bunch, L)
+    
   ramp_per_particle = p_over_q_ref isa TimeDependentParam && ramp_update_each_particle
   bunch_beta_gamma = R_to_beta_gamma(bunch.species, bunch.p_over_q_ref)
 
