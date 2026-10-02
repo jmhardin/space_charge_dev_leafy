@@ -105,30 +105,6 @@ end
   a_arr = real.(fft(fftshift(f_arr)))/(2*M)
   return a_arr[2:(N+1)], L
 end
-
-@generated function faddeeva_bak2(z::CVec{V}, ::Val{M}) where {V,M}
-    T = V <: Vec ? eltype(V) : V
-    a_arr, L = __faddeeva_coeff(M, T)
-    a_arr = reverse(a_arr)
-    ex = :($(a_arr[1]))
-    for i in 2:M
-        ex = :($ex * Z + $(a_arr[i]))
-    end
-    invsqrtpi = 1 / sqrt(T(pi))
-    return quote
-        mask = z.im >= zero($V)
-        c2   = vifelse(mask, one($V), -one($V))
-        zr   = z * c2
-
-        lmiz_inv = inv($L - im_mul(zr))
-        Z    = ($L + im_mul(zr)) * lmiz_inv
-
-        base = (2*$ex*lmiz_inv + $invsqrtpi) * lmiz_inv
-        expo = 2*cexp(-(zr*zr))
-
-        return vifelse(mask, base, expo - base)
-    end
-end
 @generated function faddeeva(z::CVec{V}, ::Val{M}) where {V,M}
     T = V <: Vec ? eltype(V) : V
     a_arr, L = __faddeeva_coeff(M, T)
@@ -147,24 +123,6 @@ end
         return c1*2*cexp(-(z*z)) + c2*(2*$ex*lmiz_inv + $(1/sqrt(T(pi))))*lmiz_inv
     end
 end
-
-@generated function faddeeva(z::Complex{T}, ::Val{N}) where {T,N}
-  a_arr, L = __faddeeva_coeff(N, T)
-  a_arr = reverse(a_arr)
-  ex = :($(a_arr[1]))
-  for i in 2:N
-    ex = :(muladd($ex, Z, $(a_arr[i])))
-  end
-  return quote
-    c1 = imag(z) >= 0 ? 0 : 1
-    c2 = 1 - 2*c1
-    z = c2*z
-    lmiz_inv = 1/($L - im*z)
-    Z = ($L + im*z)*lmiz_inv
-    return c1*2*exp(-z^2) + c2*(2*$ex*lmiz_inv + $(1/sqrt(T(pi))))*lmiz_inv
-  end
-end
-
 
 @inline function gaus_space_charge_kick!(i, coords::Coords,means,sigmas,L,N,locXI,locYI,locPXI,locPYI)
     #println(means)
@@ -186,7 +144,6 @@ end
     r_sq = X*X + Y*Y
     r = sqrt(r_sq)
     #precompute this later? Depends on particle...
-    #gamma = sqrt(5.11e5*5.11e5 + PZ*PZ)/5.11e5
     gamma = sqrt(5.11e5*5.11e5 + means[PZI]*means[PZI])/5.11e5
 
     beta = sqrt(1 - 1/(gamma*gamma))#this REALLY wants precomputation, or at least taylor expansion
@@ -205,74 +162,23 @@ end
     k = 1.44e-9 #ev-m
 
     #These can't be complex by construction
-    #sig_denom = Complex(sig_x*sig_x-sig_y*sig_y)
-    #A = sqrt(Complex(sqrt(2*pi)*k/sig_denom))
     sig_denom = sig_x*sig_x-sig_y*sig_y
     A = k*sqrt(2*pi/sig_denom)
-    #=
-    print(k)
-    print(" ")
-    print(sig_x)
-    print(" ")
-    print(sig_y)
-    print(" ")
-    print(sig_z)
-    print(" ")
-    println(sig_denom)
-    =#
-    
-    
-    #-------
-    #argB = Complex(X,Y)
     B = faddeeva(CVec(X/sqrt(2*sig_denom), Y/sqrt(2*sig_denom)))
 
     C = faddeeva(CVec(X*sig_y/sig_x/sqrt(2*sig_denom),Y*sig_x/sig_y/sqrt(2*sig_denom)))
     
     expD = exp(-X*X/(2*sig_x2) - Y*Y/(2*sig_y2))
-    
-    
-    #=
-    #print(A)
-    print(" ")
-    print(B)
-    print(" ")
-    #print(C)
-    print(" ")
-    #print(expD)
-    println("")
-    =#
     #force
     result = z_dens*A*(B - expD*C)
-    mask = C.im != C.im
-    mask2 = C.re != C.re
-    #=
-    println(mask)
-    println(mask2)
-    println(X*sig_y/sig_x/sqrt(2*sig_denom))
-    println(Y*sig_x/sig_y/sqrt(2*sig_denom))
-    println(Y)
-    println(sig_x)
-    println(sig_y)
-    println(sig_denom)
-    =#
+
     proper_time = L/(beta*gamma)
     #impulse
     result = result*proper_time
 
-    #force
-    #result_real = z_dens*A*(Bu - expD*Cu)
-    #result_imag = z_dens*A*(Bv - expD*Cu)
-    #proper_time = L/(beta*gamma)
-    #impulse
-    #result_real = result_real*proper_time
-    #result_imag = result_imag*proper_time
-
-    
     loc_x_impulse = result.im
     loc_y_impulse = result.re
 
-    #loc_x_impulse = result_imag
-    #loc_y_impulse = result_real
     v[i,locPXI] = v[i,locPXI] + loc_x_impulse
     v[i,locPYI] = v[i,locPYI] + loc_y_impulse
 end
