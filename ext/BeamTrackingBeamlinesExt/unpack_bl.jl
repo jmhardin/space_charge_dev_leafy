@@ -90,8 +90,6 @@ function vmap!(f, outre::Vector{T}, outim::Vector{T},
     return outre, outim
 end
 
-
-
 @inline faddeeva(z) = faddeeva(z, Val(48))
 
 @inline function __faddeeva_coeff(n, type::Type=Float64)
@@ -185,9 +183,6 @@ end
 @inline function gaus_space_charge(kc, bunch, L)
   backend = get_backend(bunch.coords.v)
   means, sigmas = mean_and_cov(bunch.coords.v, bunch.coords.weight, backend)
-  #sigmas = Symmetric(sigmas)
-  #println(sigmas[:,1])
-  #println(sigmas)
   N = length(bunch.coords.v)/6
   locXI = XI
   locYI = YI
@@ -203,7 +198,6 @@ end
         locPXI = PYI
         locPYI = PXI
   end
-  #print(N)
   return push(kc, make_kernel_call(gaus_space_charge_kick!,(means,sigmas,L,N,locXI,locYI,locPXI,locPYI)))
 end
 
